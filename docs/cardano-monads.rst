@@ -394,53 +394,45 @@ Usage of Effect Context Sums
 
 Rather than using a method dictionary, in order to avoid lifting/unlifting
 altogether, we use effect context sums. For example, consider the following
-hypothetical method dictionary:
+hypothetical method dictionary::
 
-```
-data MonadDbGet m = MonadDbGet
-  { dbGet :: DBTag -> ByteString -> m (Maybe ByteString)
-  }
-```
+    data MonadDbGet m = MonadDbGet
+      { dbGet :: DBTag -> ByteString -> m (Maybe ByteString)
+      }
 
-There are two implementations for it:
+There are two implementations for it::
 
-```
-dbGetRocks :: MonadRealDB ctx m => DBTag -> ByteString -> m (Maybe ByteString)
-dbGetRocks tag key = getDBByTag tag >>= rocksGetBytes key
+    dbGetRocks :: MonadRealDB ctx m => DBTag -> ByteString -> m (Maybe ByteString)
+    dbGetRocks tag key = getDBByTag tag >>= rocksGetBytes key
 
-dbGetPure :: MonadPureDB ctx m => DBTag -> ByteString -> m (Maybe ByteString)
-dbGetPure (tagToLens -> l) key =
-    view (l . at key) <$> (view (lensOf @DBPureVar) >>= readIORef)
-```
+    dbGetPure :: MonadPureDB ctx m => DBTag -> ByteString -> m (Maybe ByteString)
+    dbGetPure (tagToLens -> l) key =
+        view (l . at key) <$> (view (lensOf @DBPureVar) >>= readIORef)
 
 In case of ``dbGetRocks``, the necessary context for this operation is having
 ``NodeDBs`` (implied by ``MonadRealDB``). In case of ``dbGetPure``, the
 necessary context is having ``DBPureVar``.
 
 Rather than put ``MonadDbGet`` effect dictionary into the ``ReaderT`` environment, we
-construct a sum of all possible context values:
+construct a sum of all possible context values::
 
-```
-data DBSum = RealDB NodeDBs | PureDB DBPureVar
-```
+    data DBSum = RealDB NodeDBs | PureDB DBPureVar
 
 This sum is used to implement a method that can use either one of the
-implementations:
+implementations::
 
-```
-eitherDB
-    :: (MonadReader ctx m, HasLens DBSum ctx DBSum)
-    => ReaderT NodeDBs m a -> ReaderT DBPureVar m a -> m a
-eitherDB ract pact = view (lensOf @DBSum) >>= \case
-    RealDB dbs -> runReaderT ract dbs
-    PureDB pdb -> runReaderT pact pdb
+    eitherDB
+        :: (MonadReader ctx m, HasLens DBSum ctx DBSum)
+        => ReaderT NodeDBs m a -> ReaderT DBPureVar m a -> m a
+    eitherDB ract pact = view (lensOf @DBSum) >>= \case
+        RealDB dbs -> runReaderT ract dbs
+        PureDB pdb -> runReaderT pact pdb
 
-dbGetSum
-    :: MonadDBSum ctx m
-    => DBTag -> ByteString -> m (Maybe ByteString)
-dbGetSum tag key =
-    eitherDB (dbGetRocks tag key) (dbGetPure tag key)
-```
+    dbGetSum
+        :: MonadDBSum ctx m
+        => DBTag -> ByteString -> m (Maybe ByteString)
+    dbGetSum tag key =
+        eitherDB (dbGetRocks tag key) (dbGetPure tag key)
 
 There are two issues with this approach:
 
@@ -604,5 +596,183 @@ ease of use for simpler types (not a single monad transformer), less boilerplate
 effect definition site (no need for helpers that ``ask`` and run a method, as
 it's done at use site), and better predictability.
 
-Verdict: preferable to `ReaderT` as long as we can put up with reduced
+Verdict: preferable to ``ReaderT`` as long as we can put up with reduced
 convenience.
+
+ReaderT over Abstract Base
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+After a discussion, @georgeee and @int-index came up with a hybrid
+approach that combines many elements of other approaches to provide a
+comprehensive solution.
+
+Design goals (in addition to already discussed criteria):
+
+* avoid data types parametrized by an abstract monad ``m``
+  (including explicit method dictionaries),
+  because it makes reasoning about code complicated
+
+* avoid hard-coded ``IO``, ``MonadIO``, ``MonadBaseControl IO``, etc,
+  in order to have good mocking capabilities and separation of concerns
+
+And here are some observations:
+
+* operationally, our monads can be ``ReaderT ctx IO`` for production code
+  and ``ReaderT ctx (ExceptT SomeException ST)`` (or similar) in
+  pure tests. Both of these provide (1) passing context, (2) throwing/catching
+  exceptions, (3) mutable state.
+
+* runtime configuration of effects arises for CLI parameters or YAML configuration
+  (for instance, the slotting method is affected by the '--no-ntp' flag). For this
+  use cases effect context sums must be sufficient.
+
+* presumably, any effect dictionary can be separated into its closure (context)
+  and top-level operations
+
+With these facts established, let us consider the approach from multiple angles:
+how effect definitions would look like, and how effect implementatinos look like.
+
+First, let us have two base monads::
+
+    newtype Prod a = Prod (IO a)
+    newtype Test a = Test (ExceptT SomeException ST a)
+
+To define an effect, in the most general case we will need two classes and a type family.
+In the first class we define the methods, mtl-style. The second class is a ``Has``-class to
+extract a part of a context. And a type family determines what context we need for the effect::
+
+    class MonadFoo b where
+        type FooContext b
+        sepulate :: HasFooContext b ctx => ReaderT ctx b Sepulki
+        patanize :: HasFooContext b ctx => ctx
+                                        -> ReaderT ctx b a
+                                        -> ReaderT ctx b (Either Patak a)
+
+    class HasFooContext b ctx where
+        fooContext :: ctx -> FooContext b
+
+A few things to notice:
+
+* the parameter ``b`` stands for "base monad", it will be instantiated to
+  something simple like ``Prod`` or ``Test``.
+
+* all methods are defined in the ``ReaderT ctx b`` monad.
+
+* we are fine with this monad being used in a negative position (in
+  ``patanize``), because it is not meant to be lifted/unlifted in any
+  circumstances.
+
+This is how we could define database-related monads this way::
+
+    class MonadDBGet b where
+        type DBContext b
+        dbGet :: HasDBContext b ctx => DBTag -> ByteString -> ReaderT ctx (Base b) (Maybe ByteString)
+
+    class HasDBContext b ctx where
+        dbContext :: ctx -> DBContext b
+        -------- or: Lens' ctx (DBContext b)
+
+The concrete implementations are defined separately from the class,
+taking the context as an explicit parameter::
+
+    --       Constraints necessary for the impl (can contain 'MonadIO' if the impl is prod-specific,
+    --             \                             but preferably shouldn't)
+    --              \
+    --               \          NodeDBs are a RocksDB-specific context
+    --                \                  /
+    dbGetRocks :: MonadRealDB ctx m => NodeDBs -> DBTag -> ByteString -> ReaderT ctx m (Maybe ByteString)
+    dbGetRocks = ...
+
+    -- Constraints for the impl (no 'MonadIO', because it's used for tests)
+    --           \
+    --            \               DBPureVar is a pure-db specific context
+    --             \                /
+    dbGetPure :: MonadPureDB m => DBPureVar -> DBTag -> ByteString -> ReaderT ctx m (Maybe ByteString)
+    dbGetPure = ...
+
+We can use these implementations to define instances for the base monads::
+
+    instance MonadDBGet Prod where
+        type DBContext Prod = NodeDBs
+        dbGet tag key = do
+          nodeDBs <- asks dbContext
+          dbGetRocks nodeDBs tag key
+
+    instance MonadDBGet Test where
+        type DBContext Test = DBPureVar
+        dbGet tag key = do
+          dbPureVar <- asks dbContext
+          dbGetPure dbPureVar tag key
+
+These instances are defined not in the modules with implementations, but in the modules
+with the base monads (``Prod`` and ``Test``), similarly to what we have now.
+
+The implementation-specific context is extracted in these method definitions.
+
+In case of ``MonadDBGet``, the choice of implementation is determined by the
+base monad (in prod we use rocksdb, in tests we use pure db). However, we also
+have cases where we need runtime configurability, when with the same base monad
+there can be different implementations. For instance, for slotting we can have
+ntp-based slotting or simple slotting, depending on whether the ``--no-ntp`` flag
+was passed. In these cases we choose to use effect sums::
+
+    instance MonadSlotting Prod where
+        type SlottingContext Prod = Either SimpleSlottingVar NtpSlottingVar
+        getCurrentSlot = do
+          sctx <- asks slottingContext
+          either getCurrentSlotSimple getCurrentSlotNtp sctx
+
+While effect context sums are closed, we are fine with it because we don't
+need extensibility at instance definition site, while the implementations
+themselves are defined independently.
+
+In order to address the issue of extensibility, for each ``Has``-class we can
+define two instances in a generic way::
+
+    class HasFooContext b ctx where
+        fooContext :: ctx -> FooContext b
+
+    instance HasFooContext b (FooContext b, _) where
+        fooContext = fst
+
+    instance {-# OVERLAPPABLE #-} HasFooContext b ctx => HasFooContext b (_, ctx) where
+        fooContext = fooContext . snd
+
+This way it's possible to add a context using ``withReader (fooCtx,)``. A
+stylistic issue with this is the use of ``{-# OVERLAPPABLE #-}``, but it seems
+rather benign here. A technical issue is that need ``FooContext`` to be a data
+family (rather than a type family) in order for this to work, but it's a simple
+change.
+
+Let us have a point-by-point rundown of the approach properties:
+
+* Flexibility: GOOD. We can use an effect locally by extending the reader
+  context, provided that the base monad supports it. We don't need to use monad
+  transformers to add an effect. We can run effects partially (by supplying only
+  a part of the context). We can have different prod/test base monads.
+
+* Extensibility: MODERATE. To define an effect we need two classes and a type/data
+  family, and the ``Has``-class presents a certain amount of boilerplate. Other than
+  that, it is good: we don't have the ``N*M`` problem.
+
+* Ease of use: GOOD (hopefully). We don't have lifting, hoisting, etc, just write
+  the code in ``ReaderT`` over an abstract base monad.
+
+* Compile-time performance: GOOD. While we do have type families, they only require
+  a single step of reduction, so this is not an issue.
+
+* Run-time performance: GOOD. Since we use classes, the methods should be
+  specialized to concrete monads, and we pass the context in a flat ``ReaderT``.
+
+* Run-time configurability: GOOD. We identify two categories of effect impls --
+  those that depend on the base monad and those that don't. In the first case
+  we don't need configurability, in the second we use effect context sums.
+
+* Predictability: SUPERB. While the types do affect the choice of implementation,
+  all code is written in a single monad, so it's easy to track which
+  implementation is used where. (We forbid ``IdentityT`` redirection layers).
+  It's extremely easy to find out what code is executed for a particular impl,
+  because it's in a top-level instance, not in a method dictionary.
+
+As you can see, the hybrid approach is a compromise. There are still issues,
+but there are no fatal flaws (we don't score LOW for any of the criteria).
