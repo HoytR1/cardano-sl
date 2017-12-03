@@ -117,7 +117,7 @@ dev: &dev
     networkConnectionTimeout: 2000
     blockRetrievalQueueSize: 100
     propagationQueueSize: 100
-    pendingTxResubmissionPeriod: 7 # seconds
+    pendingTxResubmissionPeriod: 2 # seconds
 
 
 ##############################################################################
