@@ -28,6 +28,8 @@ import           Pos.Wallet.Web.State         (PtxMetaUpdate (PtxMarkAcknowledge
                                                addOnlyNewPendingTx, casPtxCondition,
                                                ptxUpdateMeta)
 
+import           Pos.Txp                      (ToilVerFailure (..), TxIn (..))
+
 -- | Handers used for to procees various pending transaction submission
 -- errors.
 -- If error is fatal for transaction, handler is supposed to throw exception.
@@ -111,7 +113,8 @@ submitAndSavePtx
     => PtxSubmissionHandlers m -> EnqueueMsg m -> PendingTx -> m ()
 submitAndSavePtx PtxSubmissionHandlers{..} enqueue ptx@PendingTx{..} = do
     ack <- submitTxRaw enqueue _ptxTxAux
-    saveTx (_ptxTxId, _ptxTxAux) `catches` handlers ack
+    -- just some errors fatal for resubmission
+    (throwM (ToilNotUnspent $ TxInUtxo _ptxTxId 0) >> saveTx (_ptxTxId, _ptxTxAux)) `catches` handlers ack
     addOnlyNewPendingTx ptx
     when ack $ ptxUpdateMeta _ptxWallet _ptxTxId PtxMarkAcknowledged
   where
